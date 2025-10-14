@@ -1,12 +1,21 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Home as HomeIcon, Bell, Settings, Plus, MapPin, LogOut } from "lucide-react";
+import { Home as HomeIcon, Bell, Settings, Plus, MapPin, LogOut, Users, Trophy, Clock, Map as MapIcon, Bluetooth } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import Map from "@/components/Map";
 import { useToast } from "@/hooks/use-toast";
 import logo from "@/assets/logo.png";
 import { supabase } from "@/integrations/supabase/client";
 import { User, Session } from "@supabase/supabase-js";
 import AuthDialog from "@/components/AuthDialog";
+import FamilyGroups from "@/components/FamilyGroups";
+import Achievements from "@/components/Achievements";
+import PlacesManager from "@/components/PlacesManager";
+import RoutinesManager from "@/components/RoutinesManager";
+import AlarmHistory from "@/components/AlarmHistory";
+import { bluetoothService } from "@/services/bluetoothService";
+import { notificationService } from "@/services/notificationService";
+import { locationService } from "@/services/locationService";
 
 interface Tracker {
   id: string;
@@ -26,6 +35,8 @@ const Home = () => {
   const [userLocation, setUserLocation] = useState<[number, number] | null>(null);
   const [homeLocation] = useState<[number, number]>([40.7128, -74.006]);
   const [activeTab, setActiveTab] = useState<"home" | "alarms" | "settings">("home");
+  const [isDriving, setIsDriving] = useState(false);
+  const [bluetoothSupported, setBluetoothSupported] = useState(false);
 
   // Auth state management
   useEffect(() => {
@@ -55,23 +66,26 @@ const Home = () => {
   }, []);
 
   useEffect(() => {
-    // Get user's real location
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setUserLocation([position.coords.latitude, position.coords.longitude]);
-        },
-        (error) => {
-          console.error("Error getting location:", error);
-          toast({
-            title: "Error de ubicación",
-            description: "No se pudo obtener tu ubicación actual",
-            variant: "destructive",
-          });
-        }
-      );
-    }
+    initializeServices();
   }, [toast]);
+
+  const initializeServices = async () => {
+    const btAvailable = await bluetoothService.isBluetoothAvailable();
+    setBluetoothSupported(btAvailable);
+
+    await notificationService.initialize();
+
+    locationService.startWatching((location) => {
+      setUserLocation([location.coords.latitude, location.coords.longitude]);
+
+      const driving = locationService.isDriving(location.coords.speed);
+      setIsDriving(driving);
+    });
+
+    return () => {
+      locationService.stopWatching();
+    };
+  };
 
   const loadTrackers = async (userId: string) => {
     const { data, error } = await supabase
@@ -100,16 +114,26 @@ const Home = () => {
     }
   };
 
-  const handleAddTracker = () => {
+  const handleAddTracker = async () => {
     if (!user) {
       setShowAuthDialog(true);
       return;
     }
 
-    toast({
-      title: "Añadir rastreador",
-      description: "Conecta tu dispositivo Bluetooth",
-    });
+    if (bluetoothSupported) {
+      const device = await bluetoothService.requestDevice();
+      if (device) {
+        toast({
+          title: "Dispositivo conectado",
+          description: `${device.name} conectado exitosamente`,
+        });
+      }
+    } else {
+      toast({
+        title: "Añadir rastreador",
+        description: "Bluetooth no disponible. Añade un rastreador virtual",
+      });
+    }
   };
 
   const handleSignOut = async () => {
@@ -150,10 +174,33 @@ const Home = () => {
     const isAwayFromHome = distanceToHome > 80;
     const essentialItemsAtHome = trackers.filter((t) => t.isEssential && t.isAtHome);
 
-    if (isAwayFromHome && essentialItemsAtHome.length > 0) {
+    if (isAwayFromHome && essentialItemsAtHome.length > 0 && !isDriving) {
+      const message = `¡ALARMA! Olvidaste: ${essentialItemsAtHome.map((t) => t.name).join(", ")}`;
+
+      if (user) {
+        notificationService.sendAlarmNotification(message, 'danger');
+
+        supabase.from('alarm_history').insert({
+          user_id: user.id,
+          type: 'forgotten_item',
+          message,
+          severity: 'danger',
+          tracker_ids: essentialItemsAtHome.map(t => t.id),
+          user_lat: userLocation[0],
+          user_lng: userLocation[1]
+        });
+      }
+
       return {
         type: "danger",
-        message: `🚨 ¡ALARMA! Olvidaste: ${essentialItemsAtHome.map((t) => t.name).join(", ")}`,
+        message: `🚨 ${message}`,
+      };
+    }
+
+    if (isDriving) {
+      return {
+        type: "info",
+        message: "🚗 Modo conducción activado. Alarmas deshabilitadas.",
       };
     }
 
@@ -173,6 +220,20 @@ const Home = () => {
   const alarm = checkAlarms();
 
   const renderContent = () => {
+    if (!user) {
+      return (
+        <div className="glass p-8 rounded-xl text-center">
+          <p className="text-muted-foreground mb-4">Inicia sesión para acceder a todas las funciones</p>
+          <Button
+            onClick={() => setShowAuthDialog(true)}
+            className="bg-gradient-to-r from-primary to-accent"
+          >
+            Iniciar Sesión
+          </Button>
+        </div>
+      );
+    }
+
     if (activeTab === "home") {
       return (
         <div className="space-y-6">
@@ -237,28 +298,43 @@ const Home = () => {
     }
 
     if (activeTab === "alarms") {
-      return (
-        <div className="space-y-4">
-          <h2 className="text-2xl font-bold">Historial de Alarmas</h2>
-          <div className="glass p-8 rounded-xl text-center text-muted-foreground">
-            <Bell className="w-12 h-12 mx-auto mb-3 opacity-50" />
-            <p>Aquí aparecerá el historial de alarmas</p>
-            <p className="text-sm mt-2">Próximamente...</p>
-          </div>
-        </div>
-      );
+      return <AlarmHistory userId={user.id} />;
     }
 
     return (
-      <div className="space-y-4">
+      <div className="space-y-6">
         <h2 className="text-2xl font-bold">Configuración</h2>
-        <div className="glass p-6 rounded-xl space-y-4">
-          {user ? (
-            <>
+
+        <Tabs defaultValue="account" className="w-full">
+          <TabsList className="grid w-full grid-cols-5">
+            <TabsTrigger value="account">Cuenta</TabsTrigger>
+            <TabsTrigger value="places"><MapIcon className="w-4 h-4" /></TabsTrigger>
+            <TabsTrigger value="routines"><Clock className="w-4 h-4" /></TabsTrigger>
+            <TabsTrigger value="groups"><Users className="w-4 h-4" /></TabsTrigger>
+            <TabsTrigger value="achievements"><Trophy className="w-4 h-4" /></TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="account" className="space-y-4">
+            <div className="glass p-6 rounded-xl space-y-4">
               <div className="space-y-2">
                 <p className="text-sm text-muted-foreground">Sesión activa</p>
                 <p className="font-medium">{user.email}</p>
               </div>
+
+              {bluetoothSupported && (
+                <div className="space-y-2">
+                  <p className="text-sm text-muted-foreground">Bluetooth</p>
+                  <Button
+                    onClick={handleAddTracker}
+                    variant="outline"
+                    className="w-full"
+                  >
+                    <Bluetooth className="h-4 w-4 mr-2" />
+                    Conectar Dispositivo
+                  </Button>
+                </div>
+              )}
+
               <Button
                 onClick={handleSignOut}
                 variant="outline"
@@ -267,19 +343,25 @@ const Home = () => {
                 <LogOut className="h-4 w-4 mr-2" />
                 Cerrar Sesión
               </Button>
-            </>
-          ) : (
-            <div className="text-center text-muted-foreground">
-              <p>Inicia sesión para guardar tus rastreadores en la nube</p>
-              <Button
-                onClick={() => setShowAuthDialog(true)}
-                className="mt-4 bg-gradient-to-r from-primary to-accent"
-              >
-                Iniciar Sesión
-              </Button>
             </div>
-          )}
-        </div>
+          </TabsContent>
+
+          <TabsContent value="places">
+            <PlacesManager userId={user.id} />
+          </TabsContent>
+
+          <TabsContent value="routines">
+            <RoutinesManager userId={user.id} />
+          </TabsContent>
+
+          <TabsContent value="groups">
+            <FamilyGroups userId={user.id} />
+          </TabsContent>
+
+          <TabsContent value="achievements">
+            <Achievements userId={user.id} />
+          </TabsContent>
+        </Tabs>
       </div>
     );
   };
